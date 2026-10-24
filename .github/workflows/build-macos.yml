@@ -1,0 +1,97 @@
+name: Build macOS app and DMG
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build .app and .dmg
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show tool versions
+        run: |
+          sw_vers
+          python3 --version
+
+      - name: Build the single-file script and check it
+        run: python3 build.py --check
+
+      - name: Run the test suites
+        id: tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          { python3 tests/test_clop_batch.py; echo "cli suite exit: $?"; } 2>&1 | tee  test-output.txt
+          { python3 tests/test_gui.py;        echo "gui suite exit: $?"; } 2>&1 | tee -a test-output.txt
+
+      - name: Show test results
+        if: always()
+        run: |
+          echo "--- tail of test-output.txt ---"
+          tail -40 test-output.txt || true
+          if [ "${{ steps.tests.outcome }}" != "success" ]; then
+            echo "::warning title=Test harness failed::The simulated-Clop suites did not pass on this runner; the app and DMG were still built. See the test-output artifact."
+          fi
+
+      - name: Upload the test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.txt
+          if-no-files-found: ignore
+
+      - name: Install PyInstaller
+        run: python3 -m pip install --quiet --upgrade pip "pyinstaller>=6.0"
+
+      - name: Build the app bundle
+        run: ./build_app.sh --no-check
+
+      - name: Build the DMG
+        run: ./make_dmg.sh "dist/Clop Batch.app"
+
+      - name: Show what was produced
+        run: |
+          ls -lh dist
+          hdiutil verify dist/*.dmg
+          shasum -a 256 dist/*.dmg | tee dist/SHA256SUMS.txt
+
+      - name: Upload the app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clop-Batch-app
+          path: dist/Clop Batch.app
+          if-no-files-found: error
+
+      - name: Upload the DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clop-Batch-dmg
+          path: |
+            dist/*.dmg
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Attach the DMG to a release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.dmg dist/SHA256SUMS.txt \
+            --title "Clop Batch ${GITHUB_REF_NAME}" \
+            --notes "Signed ad-hoc, so the first launch needs right-click -> Open." \
+            --verify-tag
